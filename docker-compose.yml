@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"   # HTTP
+      - "8443:8443"   # HTTPS
+      - "9000:9000"   # Native TCP
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: testing123
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  datadog-agent:
+    image: gcr.io/datadoghq/agent:7
+    environment:
+      DD_API_KEY: "${DD_API_KEY}"
+      DD_SITE: "datadoghq.com"
+      DD_LOGS_ENABLED: "true"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "false"
+    volumes:
+      # Check file
+      - ./checks/clickhouse_cloud.py:/etc/datadog-agent/checks.d/clickhouse_cloud.py:ro
+      - ./queries.py:/etc/datadog-agent/checks.d/queries.py:ro
+      # Log check config
+      - ./conf.d/clickhouse_cloud.yaml.example:/etc/datadog-agent/conf.d/clickhouse_cloud.d/conf.yaml:ro
+      # OpenMetrics config
+      - ./conf.d/openmetrics_clickhouse.yaml.example:/etc/datadog-agent/conf.d/openmetrics.d/conf.yaml:ro
+    depends_on:
+      - clickhouse
+
+volumes:
+  clickhouse-data:

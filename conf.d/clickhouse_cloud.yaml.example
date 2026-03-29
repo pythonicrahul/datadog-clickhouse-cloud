@@ -1,0 +1,21 @@
+init_config:
+
+instances:
+  - host: "<your-cluster>.clickhouse.cloud"    # required
+    port: 8443                                  # default: 8443
+    user: "<your-user>"                         # required
+    api_key: "<your-api-key>"                   # required
+
+    # Log collection toggles
+    collect_query_logs: true                    # default: true
+    collect_text_logs: true                     # default: true
+
+    # Tuning
+    log_batch_size: 1000                        # rows per check run
+    slow_query_threshold_ms: 5000              # marks query logs as warning
+    initial_backfill_minutes: 60               # lookback window on first run
+
+    # Applied to all logs shipped
+    tags:
+      - "env:production"
+      - "clickhouse_cluster:<your-cluster-name>"

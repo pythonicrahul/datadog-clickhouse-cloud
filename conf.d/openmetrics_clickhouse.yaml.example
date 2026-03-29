@@ -1,0 +1,29 @@
+instances:
+  - openmetrics_endpoint: "https://<your-cluster>.clickhouse.cloud:8443/metrics"
+    namespace: "clickhouse"
+    extra_headers:
+      X-ClickHouse-User: "<your-user>"
+      X-ClickHouse-Key: "<your-api-key>"
+    tls_verify: true
+    metrics:
+      - ClickHouseMetrics_Query
+      - ClickHouseMetrics_TCPConnection
+      - ClickHouseMetrics_HTTPConnection
+      - ClickHouseProfileEvents_Query
+      - ClickHouseProfileEvents_SelectQuery
+      - ClickHouseProfileEvents_InsertQuery
+      - ClickHouseProfileEvents_FailedQuery
+      - ClickHouseAsyncMetrics_MemoryResident
+      - ClickHouseAsyncMetrics_MarkCacheBytes
+      - ClickHouseAsyncMetrics_UncompressedCacheBytes
+      - ClickHouseMetrics_Merge
+      - ClickHouseMetrics_PartMutation
+      - ClickHouseAsyncMetrics_DiskUsed_default
+      - ClickHouseAsyncMetrics_DiskAvailable_default
+      - ClickHouseProfileEvents_InsertedRows
+      - ClickHouseProfileEvents_ReadCompressedBytes
+      - ClickHouseProfileEvents_NetworkReceiveBytes
+      - ClickHouseProfileEvents_NetworkSendBytes
+    tags:
+      - "env:production"
+      - "clickhouse_cluster:<your-cluster-name>"

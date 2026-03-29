@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets / local config — never commit filled-in credentials
+conf.d/clickhouse_cloud.yaml
+conf.d/openmetrics_clickhouse.yaml
+*.yaml.local
+.env
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker volumes
+clickhouse-data/
+
+PRD.md
