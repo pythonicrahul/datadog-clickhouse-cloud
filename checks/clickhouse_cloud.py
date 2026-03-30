@@ -7,17 +7,50 @@ from ClickHouse Cloud via HTTPS and ships them to Datadog Logs.
 
 import json
 import time
-import os
-import sys
-
-# Add parent directory to path so we can import queries.py
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests
 from datadog_checks.base import AgentCheck
 
-from queries import QUERY_LOG_SQL, TEXT_LOG_SQL
 
+QUERY_LOG_SQL = """
+SELECT
+    event_time,
+    event_time_microseconds,
+    query_id,
+    user,
+    query_duration_ms,
+    memory_usage,
+    read_rows,
+    read_bytes,
+    result_rows,
+    written_rows,
+    exception,
+    exception_code,
+    query,
+    type,
+    arrayStringConcat(tables, ', ') AS tables,
+    client_name
+FROM system.query_log
+WHERE type IN (2, 3)
+  AND event_time_microseconds > {last_cursor}
+ORDER BY event_time_microseconds ASC
+LIMIT {batch_size}
+"""
+
+TEXT_LOG_SQL = """
+SELECT
+    event_time,
+    event_time_microseconds,
+    level,
+    logger_name,
+    message,
+    thread_id
+FROM system.text_log
+WHERE level IN ('Error', 'Warning', 'Fatal')
+  AND event_time_microseconds > {last_cursor}
+ORDER BY event_time_microseconds ASC
+LIMIT {batch_size}
+"""
 
 CURSOR_QUERY_LOG = "clickhouse_cloud.cursor.query_log"
 CURSOR_TEXT_LOG = "clickhouse_cloud.cursor.text_log"

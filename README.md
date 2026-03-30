@@ -94,11 +94,10 @@ Replace the placeholders:
 
 ## Step 4 — Install the Log Check
 
-Copy the custom check and its query module:
+Copy the custom check:
 
 ```bash
 sudo cp checks/clickhouse_cloud.py /etc/datadog-agent/checks.d/clickhouse_cloud.py
-sudo cp queries.py /etc/datadog-agent/checks.d/queries.py
 ```
 
 ---
@@ -231,12 +230,6 @@ ClickHouse Cloud
 ---
 
 ## Local Development
-
-Spin up a local ClickHouse + Datadog Agent for testing:
-
-```bash
-DD_API_KEY=<your-dd-api-key> docker compose up -d
-```
 
 Run unit tests:
 
