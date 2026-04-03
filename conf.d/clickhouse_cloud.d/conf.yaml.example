@@ -40,6 +40,16 @@ instances:
     #
     # collect_text_logs: true
 
+    ## @param exclude_internal_users - boolean - optional - default: true
+    ## Exclude queries from ClickHouse Cloud internal service accounts.
+    ## ClickHouse Cloud runs health checks, backups, and observability queries
+    ## under system accounts (e.g. clickhouse-cloud-monitor, *-internal,
+    ## prometheus-exporter) that generate ~99% of query_log volume on idle
+    ## clusters with no operational value for application teams.
+    ## Set to false if you need visibility into internal platform queries.
+    #
+    # exclude_internal_users: true
+
     ## @param log_batch_size - integer - optional - default: 1000
     ## Maximum number of log rows fetched per check run, per table.
     ## Range: 1–10000. Higher values reduce API calls but increase memory usage.

@@ -11,8 +11,10 @@ from conftest import MockAgentCheck
 from checks.clickhouse_cloud import (
     GAUGE_QUERY_LOG_ROWS,
     GAUGE_TEXT_LOG_ROWS,
+    INTERNAL_USER_FILTER,
     SC_QUERY_LOG_CONNECT,
     SC_TEXT_LOG_CONNECT,
+    TEXT_LOG_SQL,
     ClickHouseCloudCheck,
 )
 
@@ -104,6 +106,9 @@ class TestBuildQueryLogPayload:
         assert payload["clickhouse.query_id"] == "abc-123-def-456"
         assert payload["clickhouse.user"] == "default"
         assert payload["clickhouse.duration_ms"] == 120
+        assert payload["clickhouse.query_kind"] == "Select"
+        assert payload["clickhouse.database"] == "default"
+        assert payload["clickhouse.written_bytes"] == 0
         assert payload["message"] == row["query"]
 
     def test_slow_query_is_warning(self, default_instance, query_log_rows):
@@ -124,6 +129,34 @@ class TestBuildQueryLogPayload:
         assert payload["clickhouse.query_type"] == "exception"
         assert payload["clickhouse.exception_code"] == 60
         assert "nonexistent" in payload["clickhouse.exception"]
+
+    def test_exception_before_start_is_error(self, default_instance):
+        check = _make_check(default_instance)
+        row = {
+            "cursor_us": 1743246012000000,
+            "query_id": "abc-before-start",
+            "user": "default",
+            "query_duration_ms": 0,
+            "memory_usage": 0,
+            "read_rows": 0,
+            "read_bytes": 0,
+            "result_rows": 0,
+            "written_rows": 0,
+            "written_bytes": 0,
+            "exception": "Code: 62. DB::Exception: Syntax error",
+            "exception_code": 62,
+            "query": "SELECTT 1",
+            "type": "ExceptionBeforeStart",
+            "query_kind": "Select",
+            "current_database": "default",
+            "tables": "",
+            "client_name": "python-driver",
+        }
+        payload = check._build_query_log_payload(row)
+
+        assert payload["status"] == "error"
+        assert payload["clickhouse.query_type"] == "exception"
+        assert payload["clickhouse.exception_code"] == 62
 
     def test_tags_are_joined(self, default_instance, query_log_rows):
         check = _make_check(default_instance)
@@ -167,6 +200,9 @@ class TestBuildQueryLogPayload:
         assert payload["clickhouse.query_id"] == ""
         assert payload["clickhouse.duration_ms"] == 0
         assert payload["clickhouse.memory_bytes"] == 0
+        assert payload["clickhouse.written_bytes"] == 0
+        assert payload["clickhouse.query_kind"] == ""
+        assert payload["clickhouse.database"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +219,7 @@ class TestBuildTextLogPayload:
         assert payload["status"] == "error"
         assert payload["ddsource"] == "clickhouse"
         assert payload["clickhouse.logger"] == "MergeTreeBackgroundExecutor"
+        assert payload["clickhouse.query_id"] == "abc-123-def-456"
         assert "Memory limit exceeded" in payload["message"]
 
     def test_warning_level(self, default_instance, text_log_rows):
@@ -199,6 +236,33 @@ class TestBuildTextLogPayload:
 
         assert payload["status"] == "critical"
         assert payload["clickhouse.thread_id"] == "1"
+
+    def test_critical_level(self, default_instance):
+        check = _make_check(default_instance)
+        row = {
+            "cursor_us": 1743246075000000,
+            "level": "Critical",
+            "logger_name": "Application",
+            "message": "Cannot allocate memory",
+            "thread_id": 99,
+            "query_id": "",
+        }
+        payload = check._build_text_log_payload(row)
+
+        assert payload["status"] == "critical"
+
+    def test_query_id_empty_when_absent(self, default_instance):
+        check = _make_check(default_instance)
+        row = {
+            "cursor_us": 1743246080000000,
+            "level": "Error",
+            "logger_name": "ServerErrorHandler",
+            "message": "Something failed",
+            "thread_id": 5,
+        }
+        payload = check._build_text_log_payload(row)
+
+        assert payload["clickhouse.query_id"] == ""
 
     def test_unknown_level_defaults_to_warning(self, default_instance):
         """Unknown log levels should map to 'warning' rather than crash."""
@@ -583,3 +647,87 @@ class TestRetryConfiguration:
     def test_session_auth_configured(self, default_instance):
         check = _make_check(default_instance)
         assert check._session.auth == ("test-key-id", "test-key-secret")
+
+
+# ---------------------------------------------------------------------------
+# Noise filter tests
+# ---------------------------------------------------------------------------
+
+
+class TestInternalUserFilter:
+    """Tests for the exclude_internal_users query_log filter."""
+
+    def test_exclude_internal_users_default_is_true(self, default_instance):
+        check = _make_check(default_instance)
+        assert check.exclude_internal_users is True
+
+    def test_exclude_internal_users_explicit_false(self, default_instance):
+        default_instance["exclude_internal_users"] = False
+        check = _make_check(default_instance)
+        assert check.exclude_internal_users is False
+
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_internal_user_filter_injected_by_default(
+        self, mock_query, default_instance, query_log_rows
+    ):
+        """When exclude_internal_users is True (default), the SQL should contain
+        the internal user filter clause."""
+        check = _make_check(default_instance)
+        mock_query.return_value = query_log_rows
+
+        check._collect_query_logs()
+
+        sql_sent = mock_query.call_args[0][0]
+        assert "%-internal" in sql_sent
+        assert "clickhouse-cloud-%" in sql_sent
+        assert "prometheus-exporter" in sql_sent
+
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_internal_user_filter_omitted_when_disabled(
+        self, mock_query, default_instance, query_log_rows
+    ):
+        """When exclude_internal_users is False, the SQL should NOT contain
+        the internal user filter clause."""
+        default_instance["exclude_internal_users"] = False
+        check = _make_check(default_instance)
+        mock_query.return_value = query_log_rows
+
+        check._collect_query_logs()
+
+        sql_sent = mock_query.call_args[0][0]
+        assert "%-internal" not in sql_sent
+        assert "clickhouse-cloud-%" not in sql_sent
+        assert "prometheus-exporter" not in sql_sent
+
+    def test_internal_user_filter_constant_syntax(self):
+        """The INTERNAL_USER_FILTER constant should be valid SQL fragments."""
+        assert "NOT LIKE" in INTERNAL_USER_FILTER
+        assert "%-internal" in INTERNAL_USER_FILTER
+        assert "clickhouse-cloud-%" in INTERNAL_USER_FILTER
+        assert "prometheus-exporter" in INTERNAL_USER_FILTER
+        assert "user != ''" in INTERNAL_USER_FILTER
+
+
+class TestQueryProfilerFilter:
+    """Tests for the text_log QueryProfiler/GlobalProfiler noise filter."""
+
+    def test_text_log_sql_excludes_query_profiler(self):
+        """TEXT_LOG_SQL should filter out QueryProfiler logger entries."""
+        assert "QueryProfiler" in TEXT_LOG_SQL
+        assert "GlobalProfiler" in TEXT_LOG_SQL
+        assert "NOT IN" in TEXT_LOG_SQL
+
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_profiler_rows_not_fetched(self, mock_query, default_instance):
+        """Rows from QueryProfiler/GlobalProfiler loggers should be excluded
+        at the SQL level — they should never appear in results."""
+        check = _make_check(default_instance)
+        # Simulate ClickHouse returning only non-profiler rows (as it should
+        # with the filter in place)
+        mock_query.return_value = []
+
+        check._collect_text_logs()
+
+        sql_sent = mock_query.call_args[0][0]
+        assert "QueryProfiler" in sql_sent
+        assert "GlobalProfiler" in sql_sent

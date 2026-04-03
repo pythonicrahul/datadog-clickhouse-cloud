@@ -35,18 +35,43 @@ SELECT
     read_bytes,
     result_rows,
     written_rows,
+    written_bytes,
     exception,
     exception_code,
     query,
     type,
+    query_kind,
+    current_database,
     arrayStringConcat(tables, ', ') AS tables,
     client_name
 FROM system.query_log
-WHERE type IN ('QueryFinish', 'ExceptionWhileProcessing')
+WHERE type IN ('QueryFinish', 'ExceptionWhileProcessing', 'ExceptionBeforeStart')
+  AND is_initial_query = 1
   AND event_time_microseconds > fromUnixTimestamp64Micro({last_cursor})
+  AND query NOT LIKE '%system.query_log%'
+  AND query NOT LIKE '%system.text_log%'
+  {internal_user_filter}
 ORDER BY event_time_microseconds ASC
 LIMIT {batch_size}
 """
+
+# Filter clause injected into QUERY_LOG_SQL when exclude_internal_users is True.
+# ClickHouse Cloud runs health checks, backups, and observability queries under
+# service accounts whose usernames follow several patterns:
+#   1. "*-internal" suffix (monitoring-internal, operator-internal, backups-internal, etc.)
+#   2. "clickhouse-cloud-*" prefix (clickhouse-cloud-monitor — the primary metrics scraper)
+#   3. "prometheus-exporter" — Prometheus metrics collection
+#   4. Empty string "" — internal system-level metrics queries (SELECT from
+#      system.dimensional_metrics, system.histogram_metrics, etc.) that run
+#      under a blank user and generate heavy query_log volume.
+# Together these generate ~99% of query_log volume on an idle cluster with zero
+# operational value for application teams.
+INTERNAL_USER_FILTER = (
+    "AND user NOT LIKE '%-internal'"
+    " AND user NOT LIKE 'clickhouse-cloud-%'"
+    " AND user != 'prometheus-exporter'"
+    " AND user != ''"
+)
 
 TEXT_LOG_SQL = """
 SELECT
@@ -55,10 +80,12 @@ SELECT
     level,
     logger_name,
     message,
-    thread_id
+    thread_id,
+    query_id
 FROM system.text_log
-WHERE level IN ('Error', 'Warning', 'Fatal')
+WHERE level IN ('Fatal', 'Critical', 'Error', 'Warning')
   AND event_time_microseconds > fromUnixTimestamp64Micro({last_cursor})
+  AND logger_name NOT IN ('QueryProfiler', 'GlobalProfiler')
 ORDER BY event_time_microseconds ASC
 LIMIT {batch_size}
 """
@@ -76,6 +103,7 @@ CURSOR_TEXT_LOG = "clickhouse_cloud.cursor.text_log"
 
 TYPE_QUERY_FINISH = "QueryFinish"
 TYPE_QUERY_EXCEPTION = "ExceptionWhileProcessing"
+TYPE_QUERY_EXCEPTION_BEFORE_START = "ExceptionBeforeStart"
 
 # ---------------------------------------------------------------------------
 # Datadog metric / service-check names
@@ -92,6 +120,7 @@ GAUGE_TEXT_LOG_ROWS = "clickhouse_cloud.text_log.rows_collected"
 
 TEXT_LOG_LEVEL_MAP: dict[str, str] = {
     "Fatal": "critical",
+    "Critical": "critical",
     "Error": "error",
     "Warning": "warning",
 }
@@ -128,6 +157,7 @@ class ClickHouseCloudCheck(AgentCheck):
         # Feature toggles
         self.collect_query_logs: bool = inst.get("collect_query_logs", True)
         self.collect_text_logs: bool = inst.get("collect_text_logs", True)
+        self.exclude_internal_users: bool = inst.get("exclude_internal_users", True)
 
         # Tuning — validate all numeric config to prevent SQL injection and
         # catch misconfiguration early (e.g. log_batch_size: "all").
@@ -371,8 +401,10 @@ class ClickHouseCloudCheck(AgentCheck):
 
     def _collect_query_logs(self) -> None:
         """Fetch new rows from system.query_log and send as Datadog logs."""
+        user_filter = INTERNAL_USER_FILTER if self.exclude_internal_users else ""
+        sql = QUERY_LOG_SQL.replace("{internal_user_filter}", user_filter)
         self._collect_logs(
-            sql_template=QUERY_LOG_SQL,
+            sql_template=sql,
             cursor_key=CURSOR_QUERY_LOG,
             check_name=SC_QUERY_LOG_CONNECT,
             gauge_name=GAUGE_QUERY_LOG_ROWS,
@@ -384,7 +416,7 @@ class ClickHouseCloudCheck(AgentCheck):
         query_type = row.get("type", "")
 
         # Determine log level
-        if query_type == TYPE_QUERY_EXCEPTION:
+        if query_type in (TYPE_QUERY_EXCEPTION, TYPE_QUERY_EXCEPTION_BEFORE_START):
             level = "error"
             type_label = "exception"
         else:
@@ -407,9 +439,12 @@ class ClickHouseCloudCheck(AgentCheck):
             "clickhouse.read_bytes": int(row.get("read_bytes", 0)),
             "clickhouse.result_rows": int(row.get("result_rows", 0)),
             "clickhouse.written_rows": int(row.get("written_rows", 0)),
+            "clickhouse.written_bytes": int(row.get("written_bytes", 0)),
             "clickhouse.exception": row.get("exception", ""),
             "clickhouse.exception_code": int(row.get("exception_code", 0)),
             "clickhouse.query_type": type_label,
+            "clickhouse.query_kind": row.get("query_kind", ""),
+            "clickhouse.database": row.get("current_database", ""),
             "clickhouse.tables": row.get("tables", ""),
             "clickhouse.client": row.get("client_name", ""),
         }
@@ -441,6 +476,7 @@ class ClickHouseCloudCheck(AgentCheck):
             "status": level,
             "clickhouse.logger": row.get("logger_name", ""),
             "clickhouse.thread_id": str(row.get("thread_id", "")),
+            "clickhouse.query_id": row.get("query_id", ""),
         }
 
     # ------------------------------------------------------------------

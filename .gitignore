@@ -38,3 +38,4 @@ clickhouse-data/
 
 PRD.md
 *.yaml
+*.csv

@@ -5,7 +5,8 @@
     "level": "Error",
     "logger_name": "MergeTreeBackgroundExecutor",
     "message": "Exception while processing merge: Code: 241. DB::Exception: Memory limit exceeded",
-    "thread_id": 12345
+    "thread_id": 12345,
+    "query_id": "abc-123-def-456"
   },
   {
     "event_time": "2026-03-29 10:01:05",
@@ -13,7 +14,8 @@
     "level": "Warning",
     "logger_name": "ReplicatedMergeTreeQueue",
     "message": "Part all_0_0_0 is not available on any replica",
-    "thread_id": 12346
+    "thread_id": 12346,
+    "query_id": ""
   },
   {
     "event_time": "2026-03-29 10:01:10",
@@ -21,6 +23,7 @@
     "level": "Fatal",
     "logger_name": "Application",
     "message": "Caught signal 11 (SIGSEGV). Stack trace: ...",
-    "thread_id": 1
+    "thread_id": 1,
+    "query_id": ""
   }
 ]
