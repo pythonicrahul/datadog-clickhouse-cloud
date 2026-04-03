@@ -2,7 +2,7 @@
 ClickHouse Cloud custom Datadog Agent check for log collection.
 
 Collects query logs (system.query_log) and server logs (system.text_log)
-from ClickHouse Cloud via HTTPS and ships them to Datadog Logs.
+from ClickHouse Cloud via the Cloud Query API and ships them to Datadog Logs.
 """
 
 import json
@@ -15,7 +15,7 @@ from datadog_checks.base import AgentCheck
 QUERY_LOG_SQL = """
 SELECT
     event_time,
-    event_time_microseconds,
+    toUnixTimestamp64Micro(event_time_microseconds) AS cursor_us,
     query_id,
     user,
     query_duration_ms,
@@ -31,8 +31,8 @@ SELECT
     arrayStringConcat(tables, ', ') AS tables,
     client_name
 FROM system.query_log
-WHERE type IN (2, 3)
-  AND event_time_microseconds > {last_cursor}
+WHERE type IN ('QueryFinish', 'ExceptionWhileProcessing')
+  AND event_time_microseconds > fromUnixTimestamp64Micro({last_cursor})
 ORDER BY event_time_microseconds ASC
 LIMIT {batch_size}
 """
@@ -40,14 +40,14 @@ LIMIT {batch_size}
 TEXT_LOG_SQL = """
 SELECT
     event_time,
-    event_time_microseconds,
+    toUnixTimestamp64Micro(event_time_microseconds) AS cursor_us,
     level,
     logger_name,
     message,
     thread_id
 FROM system.text_log
 WHERE level IN ('Error', 'Warning', 'Fatal')
-  AND event_time_microseconds > {last_cursor}
+  AND event_time_microseconds > fromUnixTimestamp64Micro({last_cursor})
 ORDER BY event_time_microseconds ASC
 LIMIT {batch_size}
 """
@@ -55,9 +55,9 @@ LIMIT {batch_size}
 CURSOR_QUERY_LOG = "clickhouse_cloud.cursor.query_log"
 CURSOR_TEXT_LOG = "clickhouse_cloud.cursor.text_log"
 
-# ClickHouse query_log type codes
-TYPE_QUERY_FINISH = 2
-TYPE_QUERY_EXCEPTION = 3
+# ClickHouse query_log type names (returned as strings by the Cloud Query API)
+TYPE_QUERY_FINISH = "QueryFinish"
+TYPE_QUERY_EXCEPTION = "ExceptionWhileProcessing"
 
 # Datadog log level mappings
 TEXT_LOG_LEVEL_MAP = {
@@ -74,10 +74,9 @@ class ClickHouseCloudCheck(AgentCheck):
         super().__init__(name, init_config, instances)
 
         instance = instances[0]
-        self.ch_host = instance["host"]
-        self.ch_port = instance.get("port", 8443)
-        self.ch_user = instance["user"]
-        self.ch_api_key = instance["api_key"]
+        self.service_id = instance["service_id"]
+        self.key_id = instance["key_id"]
+        self.key_secret = instance["key_secret"]
 
         self.collect_query_logs = instance.get("collect_query_logs", True)
         self.collect_text_logs = instance.get("collect_text_logs", True)
@@ -86,15 +85,13 @@ class ClickHouseCloudCheck(AgentCheck):
         self.initial_backfill_minutes = instance.get("initial_backfill_minutes", 60)
         self.custom_tags = instance.get("tags", [])
 
-        self.base_url = "https://{}:{}".format(self.ch_host, self.ch_port)
+        self.base_url = "https://queries.clickhouse.cloud/service/{}/run".format(
+            self.service_id
+        )
 
         self._session = requests.Session()
-        self._session.headers.update(
-            {
-                "X-ClickHouse-User": self.ch_user,
-                "X-ClickHouse-Key": self.ch_api_key,
-            }
-        )
+        self._session.auth = (self.key_id, self.key_secret)
+        self._session.headers.update({"Content-Type": "application/json"})
         self._session.verify = True
 
     # ------------------------------------------------------------------
@@ -119,23 +116,46 @@ class ClickHouseCloudCheck(AgentCheck):
         epoch_us = int((time.time() - backfill_seconds) * 1_000_000)
         return epoch_us
 
+    def _timestamp_seconds(self, row):
+        """Return a Unix timestamp in seconds for Datadog's send_log API."""
+        try:
+            return int(row.get("cursor_us", 0)) / 1_000_000
+        except (TypeError, ValueError):
+            return time.time()
+
+    def _emit_log(self, log_entry):
+        """Send log entry using Agent APIs available in the current runtime.
+
+        Newer Datadog Agent runtimes expose AgentCheck.send_log(). Older runtimes
+        do not; in that case we write JSON to the check logger as a fallback so
+        the check keeps running without raising AttributeError.
+        """
+        send_log = getattr(self, "send_log", None)
+        if callable(send_log):
+            send_log(log_entry)
+            return
+
+        self.log.info(json.dumps(log_entry, separators=(",", ":")))
+
     # ------------------------------------------------------------------
     # ClickHouse HTTP interface
     # ------------------------------------------------------------------
 
     def _query_clickhouse(self, sql):
-        """Execute a SQL query against ClickHouse Cloud via HTTPS POST.
+        """Execute a SQL query against ClickHouse Cloud via the Cloud Query API.
 
         Returns a list of dicts (one per row) using JSONEachRow format.
         """
-        url = self.base_url
-        params = {"query": sql, "default_format": "JSONEachRow"}
+        params = {"format": "JSONEachRow"}
+        body = {"sql": sql}
 
         try:
-            resp = self._session.post(url, params=params, timeout=30)
+            resp = self._session.post(
+                self.base_url, params=params, json=body, timeout=30
+            )
             resp.raise_for_status()
         except requests.exceptions.RequestException as e:
-            self.log.error("ClickHouse query failed: %s", e)
+            self.log.error("ClickHouse Cloud API query failed: %s", e)
             raise
 
         rows = []
@@ -171,15 +191,15 @@ class ClickHouseCloudCheck(AgentCheck):
 
         for row in rows:
             log_entry = self._build_query_log_payload(row)
-            self.send_log(log_entry)
+            self._emit_log(log_entry)
 
         # Update cursor to the last row's microsecond timestamp
-        last_cursor = int(rows[-1]["event_time_microseconds"])
+        last_cursor = int(rows[-1]["cursor_us"])
         self._set_cursor(CURSOR_QUERY_LOG, last_cursor)
 
     def _build_query_log_payload(self, row):
         """Map a query_log row to a Datadog log entry."""
-        query_type = int(row.get("type", 0))
+        query_type = row.get("type", "")
 
         # Determine log level
         if query_type == TYPE_QUERY_EXCEPTION:
@@ -194,7 +214,7 @@ class ClickHouseCloudCheck(AgentCheck):
             type_label = "finish"
 
         return {
-            "timestamp": row.get("event_time"),
+            "timestamp": self._timestamp_seconds(row),
             "message": row.get("query", ""),
             "ddsource": "clickhouse_cloud",
             "ddtags": ",".join(self.custom_tags) if self.custom_tags else "",
@@ -242,9 +262,9 @@ class ClickHouseCloudCheck(AgentCheck):
 
         for row in rows:
             log_entry = self._build_text_log_payload(row)
-            self.send_log(log_entry)
+            self._emit_log(log_entry)
 
-        last_cursor = int(rows[-1]["event_time_microseconds"])
+        last_cursor = int(rows[-1]["cursor_us"])
         self._set_cursor(CURSOR_TEXT_LOG, last_cursor)
 
     def _build_text_log_payload(self, row):
@@ -252,7 +272,7 @@ class ClickHouseCloudCheck(AgentCheck):
         level = TEXT_LOG_LEVEL_MAP.get(row.get("level", ""), "warning")
 
         return {
-            "timestamp": row.get("event_time"),
+            "timestamp": self._timestamp_seconds(row),
             "message": row.get("message", ""),
             "ddsource": "clickhouse_cloud",
             "ddtags": ",".join(self.custom_tags) if self.custom_tags else "",

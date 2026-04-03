@@ -1,10 +1,9 @@
 init_config:
 
 instances:
-  - host: "<your-cluster>.clickhouse.cloud"    # required
-    port: 8443                                  # default: 8443
-    user: "<your-user>"                         # required
-    api_key: "<your-api-key>"                   # required
+  - service_id: "<your-service-uuid>"          # required – ClickHouse Cloud service UUID
+    key_id: "<your-api-key-id>"                 # required – Cloud API key ID
+    key_secret: "<your-api-key-secret>"         # required – Cloud API key secret
 
     # Log collection toggles
     collect_query_logs: true                    # default: true
@@ -17,5 +16,5 @@ instances:
 
     # Applied to all logs shipped
     tags:
-      - "env:production"
+      - "env:prod"
       - "clickhouse_cluster:<your-cluster-name>"

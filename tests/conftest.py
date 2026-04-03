@@ -23,10 +23,9 @@ def text_log_rows():
 @pytest.fixture
 def default_instance():
     return {
-        "host": "test-cluster.clickhouse.cloud",
-        "port": 8443,
-        "user": "default",
-        "api_key": "test-api-key",
+        "service_id": "test-service-uuid",
+        "key_id": "test-key-id",
+        "key_secret": "test-key-secret",
         "collect_query_logs": True,
         "collect_text_logs": True,
         "log_batch_size": 1000,

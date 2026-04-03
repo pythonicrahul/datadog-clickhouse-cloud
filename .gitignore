@@ -37,3 +37,4 @@ conf.d/openmetrics_clickhouse.yaml
 clickhouse-data/
 
 PRD.md
+*.yaml

@@ -1,0 +1,28 @@
+## ClickHouse Cloud Prometheus API approach (recommended)
+## Uses Cloud API keys – same credentials as the log check.
+## Get your org ID from the ClickHouse Cloud console URL.
+##
+## Endpoint variants:
+##   Org-wide:  /v1/organizations/<org-id>/prometheus
+##   Per-service: /v1/organizations/<org-id>/services/<service-id>/prometheus
+## Add ?filtered_metrics=true to return a curated subset from ClickHouse Cloud.
+
+instances:
+  - openmetrics_endpoint: "https://api.clickhouse.cloud/v1/organizations/<your-org-id>/prometheus?filtered_metrics=true"
+    namespace: "clickhouse"
+    username: "<your-key-id>"
+    password: "<your-key-secret>"
+    tls_verify: true
+    honor_labels: true
+    metrics:
+      # Default: collect all ClickHouse metrics exposed by this endpoint.
+      - "^ClickHouse.*"
+
+      # Optional: replace the line above with a small allowlist to reduce volume.
+      # - ClickHouseMetrics_Query
+      # - ClickHouseMetrics_HTTPConnection
+      # - ClickHouseAsyncMetrics_MemoryResident
+      # - ClickHouseProfileEvents_FailedQuery
+    tags:
+      - "env:prod"
+      - "clickhouse_cluster:<your-cluster-name>"

@@ -1,7 +1,7 @@
 [
   {
     "event_time": "2026-03-29 10:00:01",
-    "event_time_microseconds": 1743246001000000,
+    "cursor_us": 1743246001000000,
     "query_id": "abc-123-def-456",
     "user": "default",
     "query_duration_ms": 120,
@@ -13,13 +13,13 @@
     "exception": "",
     "exception_code": 0,
     "query": "SELECT count() FROM events WHERE date > '2026-03-01'",
-    "type": 2,
+    "type": "QueryFinish",
     "tables": "default.events",
     "client_name": "python-driver"
   },
   {
     "event_time": "2026-03-29 10:00:05",
-    "event_time_microseconds": 1743246005000000,
+    "cursor_us": 1743246005000000,
     "query_id": "abc-123-def-789",
     "user": "analytics",
     "query_duration_ms": 8500,
@@ -31,13 +31,13 @@
     "exception": "",
     "exception_code": 0,
     "query": "SELECT uniq(user_id) FROM events",
-    "type": 2,
+    "type": "QueryFinish",
     "tables": "default.events",
     "client_name": "clickhouse-client"
   },
   {
     "event_time": "2026-03-29 10:00:10",
-    "event_time_microseconds": 1743246010000000,
+    "cursor_us": 1743246010000000,
     "query_id": "abc-123-def-999",
     "user": "default",
     "query_duration_ms": 50,
@@ -49,7 +49,7 @@
     "exception": "Code: 60. DB::Exception: Table default.nonexistent doesn't exist.",
     "exception_code": 60,
     "query": "SELECT * FROM nonexistent",
-    "type": 3,
+    "type": "ExceptionWhileProcessing",
     "tables": "",
     "client_name": "python-driver"
   }

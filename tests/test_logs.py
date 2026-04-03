@@ -229,6 +229,18 @@ class TestCollectQueryLogs:
         assert ("clickhouse_cloud.query_log.can_connect", MockAgentCheck.CRITICAL) in check._service_checks
         assert len(check._sent_logs) == 0
 
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_no_send_log_method_does_not_crash(self, mock_query, default_instance, query_log_rows):
+        check = _make_check(default_instance)
+        mock_query.return_value = query_log_rows[:1]
+
+        # Simulate older AgentCheck implementations that don't expose send_log.
+        check.send_log = None
+
+        check._collect_query_logs()
+
+        assert check.log.info.called
+
 
 class TestCollectTextLogs:
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
