@@ -7,6 +7,8 @@ from ClickHouse Cloud via the Cloud Query API and ships them to Datadog Logs.
 
 from __future__ import annotations
 
+__version__ = "1.0.0"
+
 import json
 import time
 from collections.abc import Callable

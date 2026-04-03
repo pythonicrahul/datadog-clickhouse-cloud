@@ -66,6 +66,7 @@ instances:
   - service_id: "<your-service-uuid>"
     key_id: "<your-api-key-id>"
     key_secret: "<your-api-key-secret>"
+    cluster_name: "<your-cluster-name>"     # appears as "service" in Datadog Logs
 
     collect_query_logs: true
     collect_text_logs: true
@@ -85,6 +86,35 @@ All three credential fields are required. Everything else has sensible defaults.
 | `slow_query_threshold_ms` | 5000 | 0 -- 3600000 | Queries slower than this are logged as `warning` |
 | `initial_backfill_minutes` | 60 | 1 -- 1440 | How far back to look on first run (avoids flooding Datadog with history) |
 | `query_timeout_seconds` | 30 | 5 -- 300 | HTTP timeout for each ClickHouse Cloud API call |
+
+### Monitoring multiple ClickHouse Cloud services
+
+Add one entry per service under `instances` in the log check config. Each instance runs independently with its own cursor, credentials, and tags:
+
+```yaml
+instances:
+  # Production cluster
+  - service_id: "abc-123-prod"
+    key_id: "<prod-key-id>"
+    key_secret: "<prod-key-secret>"
+    cluster_name: "prod-analytics"
+    tags:
+      - "env:production"
+      - "clickhouse_cluster:prod-analytics"
+
+  # Staging cluster
+  - service_id: "def-456-staging"
+    key_id: "<staging-key-id>"
+    key_secret: "<staging-key-secret>"
+    cluster_name: "staging-analytics"
+    collect_text_logs: false          # only query logs for staging
+    log_batch_size: 500
+    tags:
+      - "env:staging"
+      - "clickhouse_cluster:staging-analytics"
+```
+
+For metrics, add a separate entry per service in the OpenMetrics config as well (each with its own org/endpoint). Use `cluster_name` and tags to distinguish services in Datadog dashboards and log facets.
 
 ### 4. Configure metrics
 

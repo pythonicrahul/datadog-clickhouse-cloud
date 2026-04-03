@@ -1,30 +1,88 @@
+## All options defined here are available to all instances.
+#
 init_config:
 
 instances:
-  - service_id: "<your-service-uuid>"          # required – ClickHouse Cloud service UUID
-    key_id: "<your-api-key-id>"                 # required – Cloud API key ID
-    key_secret: "<your-api-key-secret>"         # required – Cloud API key secret
 
-    # Cluster / service identity
-    cluster_name: "<your-cluster-name>"         # used as the "service" field in Datadog Logs
-                                                # (default: "clickhouse")
+    ## @param service_id - string - required
+    ## ClickHouse Cloud service UUID.
+    ## Found in the ClickHouse Cloud console under your service's connection details.
+    #
+  - service_id: "<your-service-uuid>"
 
-    # Log collection toggles
-    collect_query_logs: true                    # default: true
-    collect_text_logs: true                     # default: true
+    ## @param key_id - string - required
+    ## ClickHouse Cloud API key ID.
+    ## Create one at https://clickhouse.cloud/settings/api-keys with query access.
+    #
+    key_id: "<your-api-key-id>"
 
-    # Tuning
-    log_batch_size: 1000                        # rows per check run (1–10000)
-    slow_query_threshold_ms: 5000              # marks query logs as warning (0–3600000)
-    initial_backfill_minutes: 60               # lookback window on first run (1–1440)
-    query_timeout_seconds: 30                  # HTTP timeout per query (5–300)
+    ## @param key_secret - string - required
+    ## ClickHouse Cloud API key secret (paired with key_id above).
+    #
+    key_secret: "<your-api-key-secret>"
 
-    # Applied to all logs shipped
-    tags:
-      - "env:prod"
-      - "clickhouse_cluster:<your-cluster-name>"
+    ## @param cluster_name - string - optional - default: clickhouse
+    ## Friendly name for this ClickHouse Cloud service.
+    ## Used as the "service" field on every Datadog log entry, making it easy
+    ## to filter logs by cluster in the Datadog Logs Explorer.
+    #
+    # cluster_name: clickhouse
 
+    ## @param collect_query_logs - boolean - optional - default: true
+    ## Enable collection of query logs from system.query_log.
+    ## Captures completed queries and exceptions with duration, memory, and row stats.
+    #
+    # collect_query_logs: true
+
+    ## @param collect_text_logs - boolean - optional - default: true
+    ## Enable collection of server logs from system.text_log.
+    ## Captures Error, Warning, and Fatal level server-side log entries.
+    #
+    # collect_text_logs: true
+
+    ## @param log_batch_size - integer - optional - default: 1000
+    ## Maximum number of log rows fetched per check run, per table.
+    ## Range: 1–10000. Higher values reduce API calls but increase memory usage.
+    #
+    # log_batch_size: 1000
+
+    ## @param slow_query_threshold_ms - integer - optional - default: 5000
+    ## Queries slower than this threshold (in milliseconds) are tagged with
+    ## status "warning" instead of "info" in Datadog Logs.
+    ## Range: 0–3600000. Set to 0 to disable slow-query highlighting.
+    #
+    # slow_query_threshold_ms: 5000
+
+    ## @param initial_backfill_minutes - integer - optional - default: 60
+    ## How far back (in minutes) to look on the very first check run when
+    ## no cursor exists yet. Subsequent runs resume from the last cursor.
+    ## Range: 1–1440 (up to 24 hours).
+    #
+    # initial_backfill_minutes: 60
+
+    ## @param query_timeout_seconds - integer - optional - default: 30
+    ## HTTP timeout in seconds for each ClickHouse Cloud Query API request.
+    ## Range: 5–300. Increase if you see timeout errors with large batch sizes.
+    #
+    # query_timeout_seconds: 30
+
+    ## @param tags - list of strings - optional
+    ## List of tags to attach to every log entry emitted by this check.
+    ##
+    ## Learn more about tagging: https://docs.datadoghq.com/tagging/
+    #
+    # tags:
+    #   - "env:prod"
+    #   - "clickhouse_cluster:<your-cluster-name>"
+
+## Log section (required for send_log() to work)
+##
+## The Datadog Agent's log launcher needs this block to open a file handle
+## for the integration. Without it, send_log() silently fails with:
+##   "Failed to write log to file, file is nil for integration ID: clickhouse_cloud"
+##
+## Do not remove or comment out this section.
+#
 logs:
   - type: integration
     source: clickhouse
-    
