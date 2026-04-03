@@ -5,12 +5,22 @@ Collects query logs (system.query_log) and server logs (system.text_log)
 from ClickHouse Cloud via the Cloud Query API and ships them to Datadog Logs.
 """
 
+from __future__ import annotations
+
 import json
 import time
+from typing import Any, Callable
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from datadog_checks.base import AgentCheck
 
+
+# ---------------------------------------------------------------------------
+# SQL templates
+# ---------------------------------------------------------------------------
 
 QUERY_LOG_SQL = """
 SELECT
@@ -52,78 +62,207 @@ ORDER BY event_time_microseconds ASC
 LIMIT {batch_size}
 """
 
+# ---------------------------------------------------------------------------
+# Cursor cache keys
+# ---------------------------------------------------------------------------
+
 CURSOR_QUERY_LOG = "clickhouse_cloud.cursor.query_log"
 CURSOR_TEXT_LOG = "clickhouse_cloud.cursor.text_log"
 
+# ---------------------------------------------------------------------------
 # ClickHouse query_log type names (returned as strings by the Cloud Query API)
+# ---------------------------------------------------------------------------
+
 TYPE_QUERY_FINISH = "QueryFinish"
 TYPE_QUERY_EXCEPTION = "ExceptionWhileProcessing"
 
-# Datadog log level mappings
-TEXT_LOG_LEVEL_MAP = {
+# ---------------------------------------------------------------------------
+# Datadog metric / service-check names
+# ---------------------------------------------------------------------------
+
+SC_QUERY_LOG_CONNECT = "clickhouse_cloud.query_log.can_connect"
+SC_TEXT_LOG_CONNECT = "clickhouse_cloud.text_log.can_connect"
+GAUGE_QUERY_LOG_ROWS = "clickhouse_cloud.query_log.rows_collected"
+GAUGE_TEXT_LOG_ROWS = "clickhouse_cloud.text_log.rows_collected"
+
+# ---------------------------------------------------------------------------
+# Datadog log level mappings for system.text_log
+# ---------------------------------------------------------------------------
+
+TEXT_LOG_LEVEL_MAP: dict[str, str] = {
     "Fatal": "critical",
     "Error": "error",
     "Warning": "warning",
 }
 
+# ---------------------------------------------------------------------------
+# Config validation bounds
+# ---------------------------------------------------------------------------
+
+MIN_BATCH_SIZE = 1
+MAX_BATCH_SIZE = 10_000
+MIN_SLOW_QUERY_MS = 0
+MAX_SLOW_QUERY_MS = 3_600_000  # 1 hour
+MIN_BACKFILL_MINUTES = 1
+MAX_BACKFILL_MINUTES = 1440  # 24 hours
+MIN_TIMEOUT_SECONDS = 5
+MAX_TIMEOUT_SECONDS = 300
+
 
 class ClickHouseCloudCheck(AgentCheck):
     """Datadog Agent check that collects logs from ClickHouse Cloud system tables."""
 
-    def __init__(self, name, init_config, instances):
+    def __init__(
+        self, name: str, init_config: dict[str, Any], instances: list[dict[str, Any]]
+    ) -> None:
         super().__init__(name, init_config, instances)
 
-        instance = instances[0]
-        self.service_id = instance["service_id"]
-        self.key_id = instance["key_id"]
-        self.key_secret = instance["key_secret"]
+        inst: dict[str, Any] = self.instance  # type: ignore[attr-defined]
 
-        self.collect_query_logs = instance.get("collect_query_logs", True)
-        self.collect_text_logs = instance.get("collect_text_logs", True)
-        self.batch_size = instance.get("log_batch_size", 1000)
-        self.slow_query_threshold_ms = instance.get("slow_query_threshold_ms", 5000)
-        self.initial_backfill_minutes = instance.get("initial_backfill_minutes", 60)
-        self.custom_tags = instance.get("tags", [])
+        # Required credentials
+        self.service_id: str = inst["service_id"]
+        self.key_id: str = inst["key_id"]
+        self.key_secret: str = inst["key_secret"]
 
-        self.base_url = "https://queries.clickhouse.cloud/service/{}/run".format(
+        # Feature toggles
+        self.collect_query_logs: bool = inst.get("collect_query_logs", True)
+        self.collect_text_logs: bool = inst.get("collect_text_logs", True)
+
+        # Tuning — validate all numeric config to prevent SQL injection and
+        # catch misconfiguration early (e.g. log_batch_size: "all").
+        self.batch_size: int = self._validate_int(
+            inst,
+            "log_batch_size",
+            default=1000,
+            lo=MIN_BATCH_SIZE,
+            hi=MAX_BATCH_SIZE,
+        )
+        self.slow_query_threshold_ms: int = self._validate_int(
+            inst,
+            "slow_query_threshold_ms",
+            default=5000,
+            lo=MIN_SLOW_QUERY_MS,
+            hi=MAX_SLOW_QUERY_MS,
+        )
+        self.initial_backfill_minutes: int = self._validate_int(
+            inst,
+            "initial_backfill_minutes",
+            default=60,
+            lo=MIN_BACKFILL_MINUTES,
+            hi=MAX_BACKFILL_MINUTES,
+        )
+        self.query_timeout_seconds: int = self._validate_int(
+            inst,
+            "query_timeout_seconds",
+            default=30,
+            lo=MIN_TIMEOUT_SECONDS,
+            hi=MAX_TIMEOUT_SECONDS,
+        )
+
+        self.custom_tags: list[str] = inst.get("tags", [])
+
+        # HTTP session with automatic retries on transient failures
+        self.base_url: str = "https://queries.clickhouse.cloud/service/{}/run".format(
             self.service_id
         )
+
+        retry_strategy = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["POST"],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
 
         self._session = requests.Session()
         self._session.auth = (self.key_id, self.key_secret)
         self._session.headers.update({"Content-Type": "application/json"})
         self._session.verify = True
+        self._session.mount("https://", adapter)
+
+    # ------------------------------------------------------------------
+    # Config validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_int(
+        inst: dict[str, Any],
+        key: str,
+        *,
+        default: int,
+        lo: int,
+        hi: int,
+    ) -> int:
+        """Parse and clamp an integer config value within [lo, hi]."""
+        raw = inst.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError("{} must be an integer, got {!r}".format(key, raw))
+        if value < lo or value > hi:
+            raise ValueError(
+                "{} must be between {} and {}, got {}".format(key, lo, hi, value)
+            )
+        return value
 
     # ------------------------------------------------------------------
     # Cursor management
     # ------------------------------------------------------------------
 
-    def _get_cursor(self, key):
+    def _get_cursor(self, key: str) -> int | None:
         """Retrieve the stored cursor (event_time_microseconds) from persistent cache."""
         cached = self.read_persistent_cache(key)
         if cached:
             return int(cached)
         return None
 
-    def _set_cursor(self, key, value):
+    def _set_cursor(self, key: str, value: int) -> None:
         """Persist the latest cursor value."""
         self.write_persistent_cache(key, str(value))
 
-    def _default_cursor(self):
+    def _default_cursor(self) -> int:
         """Return a microsecond timestamp for initial_backfill_minutes ago."""
         backfill_seconds = self.initial_backfill_minutes * 60
         # ClickHouse event_time_microseconds is a DateTime64(6) stored as UInt64 microseconds
         epoch_us = int((time.time() - backfill_seconds) * 1_000_000)
         return epoch_us
 
-    def _timestamp_seconds(self, row):
+    def _timestamp_seconds(self, row: dict[str, Any]) -> float:
         """Return a Unix timestamp in seconds for Datadog's send_log API."""
         try:
             return int(row.get("cursor_us", 0)) / 1_000_000
         except (TypeError, ValueError):
+            self.log.warning(
+                "Could not parse cursor_us=%r from row, falling back to current time",
+                row.get("cursor_us"),
+            )
             return time.time()
 
-    def _emit_log(self, log_entry):
+    def _extract_cursor(self, rows: list[dict[str, Any]], source: str) -> int | None:
+        """Safely extract the cursor value from the last row in a batch.
+
+        Returns None (and logs a warning) when the field is missing or
+        unparseable, so the caller can decide whether to update the stored
+        cursor.
+        """
+        raw = rows[-1].get("cursor_us") if rows else None
+        if raw is None:
+            self.log.warning(
+                "%s: last row missing cursor_us field, cursor will not advance",
+                source,
+            )
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            self.log.warning(
+                "%s: could not parse cursor_us=%r as integer, cursor will not advance",
+                source,
+                raw,
+            )
+            return None
+
+    def _emit_log(self, log_entry: dict[str, Any]) -> None:
         """Send log entry using Agent APIs available in the current runtime.
 
         Newer Datadog Agent runtimes expose AgentCheck.send_log(). Older runtimes
@@ -141,63 +280,105 @@ class ClickHouseCloudCheck(AgentCheck):
     # ClickHouse HTTP interface
     # ------------------------------------------------------------------
 
-    def _query_clickhouse(self, sql):
+    def _query_clickhouse(self, sql: str) -> list[dict[str, Any]]:
         """Execute a SQL query against ClickHouse Cloud via the Cloud Query API.
 
         Returns a list of dicts (one per row) using JSONEachRow format.
+        The session is configured with automatic retries on 502/503/504.
         """
         params = {"format": "JSONEachRow"}
         body = {"sql": sql}
 
         try:
             resp = self._session.post(
-                self.base_url, params=params, json=body, timeout=30
+                self.base_url,
+                params=params,
+                json=body,
+                timeout=self.query_timeout_seconds,
             )
             resp.raise_for_status()
         except requests.exceptions.RequestException as e:
             self.log.error("ClickHouse Cloud API query failed: %s", e)
             raise
 
-        rows = []
+        rows: list[dict[str, Any]] = []
         for line in resp.text.strip().splitlines():
             if line:
                 rows.append(json.loads(line))
         return rows
 
     # ------------------------------------------------------------------
-    # Query log collection
+    # Unified log collection
     # ------------------------------------------------------------------
 
-    def _collect_query_logs(self):
-        """Fetch new rows from system.query_log and send as Datadog logs."""
-        cursor = self._get_cursor(CURSOR_QUERY_LOG)
+    def _collect_logs(
+        self,
+        sql_template: str,
+        cursor_key: str,
+        check_name: str,
+        gauge_name: str,
+        build_payload: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        """Fetch new rows from a ClickHouse system table and ship as Datadog logs.
+
+        This is the shared pipeline used by both query-log and text-log collection.
+        Duplicate delivery is preferred over log loss — if *_emit_log* fails for a
+        single row the loop continues, and the cursor still advances to avoid
+        re-fetching the entire batch on the next run.
+        """
+        cursor = self._get_cursor(cursor_key)
         if cursor is None:
             cursor = self._default_cursor()
 
-        sql = QUERY_LOG_SQL.format(last_cursor=cursor, batch_size=self.batch_size)
+        sql = sql_template.format(last_cursor=cursor, batch_size=self.batch_size)
 
         try:
             rows = self._query_clickhouse(sql)
         except Exception:
-            self.service_check("clickhouse_cloud.query_log.can_connect", AgentCheck.CRITICAL)
+            self.service_check(check_name, AgentCheck.CRITICAL)
             return
 
-        self.service_check("clickhouse_cloud.query_log.can_connect", AgentCheck.OK)
-        self.gauge("clickhouse_cloud.query_log.rows_collected", len(rows))
-        self.log.debug("query_log: fetched %d rows", len(rows))
+        self.service_check(check_name, AgentCheck.OK)
+        self.gauge(gauge_name, len(rows))
+        self.log.debug("%s: fetched %d rows", cursor_key, len(rows))
 
         if not rows:
             return
 
         for row in rows:
-            log_entry = self._build_query_log_payload(row)
-            self._emit_log(log_entry)
+            try:
+                log_entry = build_payload(row)
+                self._emit_log(log_entry)
+            except Exception:
+                self.log.exception(
+                    "%s: failed to emit log for row cursor_us=%s",
+                    cursor_key,
+                    row.get("cursor_us", "?"),
+                )
 
-        # Update cursor to the last row's microsecond timestamp
-        last_cursor = int(rows[-1]["cursor_us"])
-        self._set_cursor(CURSOR_QUERY_LOG, last_cursor)
+        # Advance the cursor so the next run picks up where we left off.
+        # If the cursor field is missing/corrupt we intentionally do NOT
+        # advance — the worst case is duplicate delivery on the next run,
+        # which is acceptable (better than losing logs).
+        new_cursor = self._extract_cursor(rows, cursor_key)
+        if new_cursor is not None:
+            self._set_cursor(cursor_key, new_cursor)
 
-    def _build_query_log_payload(self, row):
+    # ------------------------------------------------------------------
+    # Query log collection
+    # ------------------------------------------------------------------
+
+    def _collect_query_logs(self) -> None:
+        """Fetch new rows from system.query_log and send as Datadog logs."""
+        self._collect_logs(
+            sql_template=QUERY_LOG_SQL,
+            cursor_key=CURSOR_QUERY_LOG,
+            check_name=SC_QUERY_LOG_CONNECT,
+            gauge_name=GAUGE_QUERY_LOG_ROWS,
+            build_payload=self._build_query_log_payload,
+        )
+
+    def _build_query_log_payload(self, row: dict[str, Any]) -> dict[str, Any]:
         """Map a query_log row to a Datadog log entry."""
         query_type = row.get("type", "")
 
@@ -239,35 +420,17 @@ class ClickHouseCloudCheck(AgentCheck):
     # Text log collection
     # ------------------------------------------------------------------
 
-    def _collect_text_logs(self):
+    def _collect_text_logs(self) -> None:
         """Fetch new rows from system.text_log and send as Datadog logs."""
-        cursor = self._get_cursor(CURSOR_TEXT_LOG)
-        if cursor is None:
-            cursor = self._default_cursor()
+        self._collect_logs(
+            sql_template=TEXT_LOG_SQL,
+            cursor_key=CURSOR_TEXT_LOG,
+            check_name=SC_TEXT_LOG_CONNECT,
+            gauge_name=GAUGE_TEXT_LOG_ROWS,
+            build_payload=self._build_text_log_payload,
+        )
 
-        sql = TEXT_LOG_SQL.format(last_cursor=cursor, batch_size=self.batch_size)
-
-        try:
-            rows = self._query_clickhouse(sql)
-        except Exception:
-            self.service_check("clickhouse_cloud.text_log.can_connect", AgentCheck.CRITICAL)
-            return
-
-        self.service_check("clickhouse_cloud.text_log.can_connect", AgentCheck.OK)
-        self.gauge("clickhouse_cloud.text_log.rows_collected", len(rows))
-        self.log.debug("text_log: fetched %d rows", len(rows))
-
-        if not rows:
-            return
-
-        for row in rows:
-            log_entry = self._build_text_log_payload(row)
-            self._emit_log(log_entry)
-
-        last_cursor = int(rows[-1]["cursor_us"])
-        self._set_cursor(CURSOR_TEXT_LOG, last_cursor)
-
-    def _build_text_log_payload(self, row):
+    def _build_text_log_payload(self, row: dict[str, Any]) -> dict[str, Any]:
         """Map a text_log row to a Datadog log entry."""
         level = TEXT_LOG_LEVEL_MAP.get(row.get("level", ""), "warning")
 
@@ -286,7 +449,7 @@ class ClickHouseCloudCheck(AgentCheck):
     # Entry point
     # ------------------------------------------------------------------
 
-    def check(self, instance):
+    def check(self, instance: dict[str, Any]) -> None:
         """Main check method called by the Datadog Agent on each run."""
         if self.collect_query_logs:
             self._collect_query_logs()

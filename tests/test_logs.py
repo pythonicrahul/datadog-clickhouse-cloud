@@ -2,56 +2,19 @@
 
 import json
 import time
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
-# Mock the datadog_checks.base module before importing the check
-import sys
-from unittest.mock import MagicMock as _MagicMock
-
-# Create a mock AgentCheck base class
-mock_agent_check_module = _MagicMock()
-
-
-class MockAgentCheck:
-    OK = 0
-    WARNING = 1
-    CRITICAL = 2
-
-    def __init__(self, name=None, init_config=None, instances=None):
-        self._persistent_cache = {}
-        self._sent_logs = []
-        self._service_checks = []
-        self._gauges = []
-        self.log = _MagicMock()
-
-    def read_persistent_cache(self, key):
-        return self._persistent_cache.get(key)
-
-    def write_persistent_cache(self, key, value):
-        self._persistent_cache[key] = value
-
-    def send_log(self, log_entry):
-        self._sent_logs.append(log_entry)
-
-    def service_check(self, name, status):
-        self._service_checks.append((name, status))
-
-    def gauge(self, name, value):
-        self._gauges.append((name, value))
-
-
-mock_agent_check_module.AgentCheck = MockAgentCheck
-sys.modules["datadog_checks"] = _MagicMock()
-sys.modules["datadog_checks.base"] = mock_agent_check_module
-
-# Now import the check module
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "checks"))
-
-from checks.clickhouse_cloud import ClickHouseCloudCheck
+from checks.clickhouse_cloud import (
+    ClickHouseCloudCheck,
+    SC_QUERY_LOG_CONNECT,
+    SC_TEXT_LOG_CONNECT,
+    GAUGE_QUERY_LOG_ROWS,
+    GAUGE_TEXT_LOG_ROWS,
+)
+from conftest import MockAgentCheck
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +24,7 @@ from checks.clickhouse_cloud import ClickHouseCloudCheck
 
 def _make_check(instance):
     """Create a ClickHouseCloudCheck instance with the mock base class."""
-    check = ClickHouseCloudCheck("clickhouse_cloud", {}, [instance])
-    return check
+    return ClickHouseCloudCheck("clickhouse_cloud", {}, [instance])
 
 
 def _mock_query_response(rows):
@@ -75,6 +37,59 @@ def _mock_query_response(rows):
 
 
 # ---------------------------------------------------------------------------
+# Config validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigValidation:
+    def test_invalid_batch_size_type_raises(self, default_instance):
+        default_instance["log_batch_size"] = "all"
+        with pytest.raises(ValueError, match="log_batch_size must be an integer"):
+            _make_check(default_instance)
+
+    def test_batch_size_too_low_raises(self, default_instance):
+        default_instance["log_batch_size"] = 0
+        with pytest.raises(ValueError, match="log_batch_size must be between"):
+            _make_check(default_instance)
+
+    def test_batch_size_too_high_raises(self, default_instance):
+        default_instance["log_batch_size"] = 99999
+        with pytest.raises(ValueError, match="log_batch_size must be between"):
+            _make_check(default_instance)
+
+    def test_valid_batch_size_accepted(self, default_instance):
+        default_instance["log_batch_size"] = 500
+        check = _make_check(default_instance)
+        assert check.batch_size == 500
+
+    def test_invalid_slow_query_threshold_raises(self, default_instance):
+        default_instance["slow_query_threshold_ms"] = -1
+        with pytest.raises(ValueError, match="slow_query_threshold_ms must be between"):
+            _make_check(default_instance)
+
+    def test_invalid_backfill_minutes_raises(self, default_instance):
+        default_instance["initial_backfill_minutes"] = 0
+        with pytest.raises(
+            ValueError, match="initial_backfill_minutes must be between"
+        ):
+            _make_check(default_instance)
+
+    def test_query_timeout_configurable(self, default_instance):
+        default_instance["query_timeout_seconds"] = 60
+        check = _make_check(default_instance)
+        assert check.query_timeout_seconds == 60
+
+    def test_query_timeout_default(self, default_instance):
+        check = _make_check(default_instance)
+        assert check.query_timeout_seconds == 30
+
+    def test_missing_required_key_raises(self, default_instance):
+        del default_instance["service_id"]
+        with pytest.raises(KeyError):
+            _make_check(default_instance)
+
+
+# ---------------------------------------------------------------------------
 # Query log payload tests
 # ---------------------------------------------------------------------------
 
@@ -82,7 +97,7 @@ def _mock_query_response(rows):
 class TestBuildQueryLogPayload:
     def test_normal_query_is_info(self, default_instance, query_log_rows):
         check = _make_check(default_instance)
-        row = query_log_rows[0]  # type=2, duration=120ms
+        row = query_log_rows[0]  # type=QueryFinish, duration=120ms
         payload = check._build_query_log_payload(row)
 
         assert payload["status"] == "info"
@@ -96,7 +111,7 @@ class TestBuildQueryLogPayload:
 
     def test_slow_query_is_warning(self, default_instance, query_log_rows):
         check = _make_check(default_instance)
-        row = query_log_rows[1]  # type=2, duration=8500ms > 5000ms threshold
+        row = query_log_rows[1]  # type=QueryFinish, duration=8500ms > 5000ms threshold
         payload = check._build_query_log_payload(row)
 
         assert payload["status"] == "warning"
@@ -105,7 +120,7 @@ class TestBuildQueryLogPayload:
 
     def test_exception_query_is_error(self, default_instance, query_log_rows):
         check = _make_check(default_instance)
-        row = query_log_rows[2]  # type=3
+        row = query_log_rows[2]  # type=ExceptionWhileProcessing
         payload = check._build_query_log_payload(row)
 
         assert payload["status"] == "error"
@@ -127,6 +142,18 @@ class TestBuildQueryLogPayload:
         payload = check._build_query_log_payload(row)
 
         assert payload["ddtags"] == ""
+
+    def test_missing_fields_use_defaults(self, default_instance):
+        """Rows with missing optional fields should not crash."""
+        check = _make_check(default_instance)
+        sparse_row = {"cursor_us": 1000000000000000, "type": "QueryFinish"}
+        payload = check._build_query_log_payload(sparse_row)
+
+        assert payload["status"] == "info"
+        assert payload["message"] == ""
+        assert payload["clickhouse.query_id"] == ""
+        assert payload["clickhouse.duration_ms"] == 0
+        assert payload["clickhouse.memory_bytes"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +187,25 @@ class TestBuildTextLogPayload:
         assert payload["status"] == "critical"
         assert payload["clickhouse.thread_id"] == "1"
 
+    def test_unknown_level_defaults_to_warning(self, default_instance):
+        """Unknown log levels should map to 'warning' rather than crash."""
+        check = _make_check(default_instance)
+        row = {
+            "cursor_us": 1000000000000000,
+            "level": "SomethingNew",
+            "message": "test",
+        }
+        payload = check._build_text_log_payload(row)
+
+        assert payload["status"] == "warning"
+
+    def test_missing_level_defaults_to_warning(self, default_instance):
+        check = _make_check(default_instance)
+        row = {"cursor_us": 1000000000000000, "message": "no level key"}
+        payload = check._build_text_log_payload(row)
+
+        assert payload["status"] == "warning"
+
 
 # ---------------------------------------------------------------------------
 # Cursor management tests
@@ -185,6 +231,139 @@ class TestCursorManagement:
         # Should be within a few seconds of (now - 60 min)
         assert abs(cursor - (now_us - backfill_us)) < 5_000_000
 
+    def test_extract_cursor_valid(self, default_instance, query_log_rows):
+        check = _make_check(default_instance)
+        result = check._extract_cursor(query_log_rows, "test_source")
+        assert result == 1743246010000000
+
+    def test_extract_cursor_missing_field(self, default_instance):
+        check = _make_check(default_instance)
+        rows = [{"event_time": "2026-01-01"}]  # no cursor_us
+        result = check._extract_cursor(rows, "test_source")
+
+        assert result is None
+        assert check.log.warning.called
+
+    def test_extract_cursor_empty_rows(self, default_instance):
+        check = _make_check(default_instance)
+        result = check._extract_cursor([], "test_source")
+
+        assert result is None
+        assert check.log.warning.called
+
+    def test_extract_cursor_unparseable(self, default_instance):
+        check = _make_check(default_instance)
+        rows = [{"cursor_us": "not_a_number"}]
+        result = check._extract_cursor(rows, "test_source")
+
+        assert result is None
+        assert check.log.warning.called
+
+
+# ---------------------------------------------------------------------------
+# Timestamp tests
+# ---------------------------------------------------------------------------
+
+
+class TestTimestampSeconds:
+    def test_valid_cursor_us(self, default_instance):
+        check = _make_check(default_instance)
+        row = {"cursor_us": 1743246001000000}
+        ts = check._timestamp_seconds(row)
+        assert ts == pytest.approx(1743246001.0)
+
+    def test_missing_cursor_us_returns_zero(self, default_instance):
+        check = _make_check(default_instance)
+        row = {}
+        ts = check._timestamp_seconds(row)
+        assert ts == 0.0
+
+    def test_corrupt_cursor_us_falls_back_with_warning(self, default_instance):
+        check = _make_check(default_instance)
+        row = {"cursor_us": "corrupt"}
+        ts = check._timestamp_seconds(row)
+
+        # Should fall back to current time
+        assert abs(ts - time.time()) < 5
+        assert check.log.warning.called
+
+
+# ---------------------------------------------------------------------------
+# HTTP layer tests (_query_clickhouse)
+# ---------------------------------------------------------------------------
+
+
+class TestQueryClickhouse:
+    def test_sends_correct_request(self, default_instance):
+        check = _make_check(default_instance)
+        mock_resp = _mock_query_response([{"col": "val"}])
+
+        with patch.object(check._session, "post", return_value=mock_resp) as mock_post:
+            rows = check._query_clickhouse("SELECT 1")
+
+        mock_post.assert_called_once_with(
+            "https://queries.clickhouse.cloud/service/test-service-uuid/run",
+            params={"format": "JSONEachRow"},
+            json={"sql": "SELECT 1"},
+            timeout=30,
+        )
+        assert rows == [{"col": "val"}]
+
+    def test_empty_response(self, default_instance):
+        check = _make_check(default_instance)
+        mock_resp = MagicMock()
+        mock_resp.text = ""
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch.object(check._session, "post", return_value=mock_resp):
+            rows = check._query_clickhouse("SELECT 1")
+
+        assert rows == []
+
+    def test_http_error_raises(self, default_instance):
+        check = _make_check(default_instance)
+
+        with patch.object(
+            check._session,
+            "post",
+            side_effect=requests.exceptions.HTTPError("500 Server Error"),
+        ):
+            with pytest.raises(requests.exceptions.HTTPError):
+                check._query_clickhouse("SELECT 1")
+
+    def test_connection_error_raises(self, default_instance):
+        check = _make_check(default_instance)
+
+        with patch.object(
+            check._session,
+            "post",
+            side_effect=requests.exceptions.ConnectionError("DNS failed"),
+        ):
+            with pytest.raises(requests.exceptions.ConnectionError):
+                check._query_clickhouse("SELECT 1")
+
+    def test_multiline_json_each_row_parsed(self, default_instance):
+        check = _make_check(default_instance)
+        mock_resp = MagicMock()
+        mock_resp.text = '{"a":1}\n{"a":2}\n{"a":3}\n'
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch.object(check._session, "post", return_value=mock_resp):
+            rows = check._query_clickhouse("SELECT a FROM t")
+
+        assert rows == [{"a": 1}, {"a": 2}, {"a": 3}]
+
+    def test_custom_timeout_used(self, default_instance):
+        default_instance["query_timeout_seconds"] = 90
+        check = _make_check(default_instance)
+        mock_resp = _mock_query_response([])
+
+        with patch.object(check._session, "post", return_value=mock_resp) as mock_post:
+            check._query_clickhouse("SELECT 1")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["timeout"] == 90
+
 
 # ---------------------------------------------------------------------------
 # Full collection flow tests
@@ -193,7 +372,9 @@ class TestCursorManagement:
 
 class TestCollectQueryLogs:
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_sends_logs_and_updates_cursor(self, mock_query, default_instance, query_log_rows):
+    def test_sends_logs_and_updates_cursor(
+        self, mock_query, default_instance, query_log_rows
+    ):
         check = _make_check(default_instance)
         mock_query.return_value = query_log_rows
 
@@ -207,7 +388,7 @@ class TestCollectQueryLogs:
         assert cursor == 1743246010000000
 
         # Service check should report OK
-        assert ("clickhouse_cloud.query_log.can_connect", MockAgentCheck.OK) in check._service_checks
+        assert (SC_QUERY_LOG_CONNECT, MockAgentCheck.OK) in check._service_checks
 
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
     def test_no_rows_does_not_update_cursor(self, mock_query, default_instance):
@@ -226,11 +407,13 @@ class TestCollectQueryLogs:
 
         check._collect_query_logs()
 
-        assert ("clickhouse_cloud.query_log.can_connect", MockAgentCheck.CRITICAL) in check._service_checks
+        assert (SC_QUERY_LOG_CONNECT, MockAgentCheck.CRITICAL) in check._service_checks
         assert len(check._sent_logs) == 0
 
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_no_send_log_method_does_not_crash(self, mock_query, default_instance, query_log_rows):
+    def test_no_send_log_method_does_not_crash(
+        self, mock_query, default_instance, query_log_rows
+    ):
         check = _make_check(default_instance)
         mock_query.return_value = query_log_rows[:1]
 
@@ -241,10 +424,62 @@ class TestCollectQueryLogs:
 
         assert check.log.info.called
 
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_partial_emit_failure_still_advances_cursor(
+        self, mock_query, default_instance, query_log_rows
+    ):
+        """If _emit_log fails for some rows, the cursor should still advance."""
+        check = _make_check(default_instance)
+        mock_query.return_value = query_log_rows
+
+        call_count = 0
+        original_emit = check._emit_log
+
+        def _flaky_emit(entry):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("Transient send_log failure")
+            original_emit(entry)
+
+        check._emit_log = _flaky_emit
+        check._collect_query_logs()
+
+        # 2 of 3 logs should have been sent (the 2nd failed)
+        assert len(check._sent_logs) == 2
+        # Cursor should still advance to last row
+        cursor = check._get_cursor("clickhouse_cloud.cursor.query_log")
+        assert cursor == 1743246010000000
+
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_missing_cursor_us_does_not_advance(self, mock_query, default_instance):
+        """If the last row has no cursor_us, cursor should not advance."""
+        check = _make_check(default_instance)
+        rows = [{"type": "QueryFinish", "query": "SELECT 1"}]  # no cursor_us
+        mock_query.return_value = rows
+
+        check._collect_query_logs()
+
+        assert check._get_cursor("clickhouse_cloud.cursor.query_log") is None
+        assert check.log.warning.called
+
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_gauge_reports_row_count(
+        self, mock_query, default_instance, query_log_rows
+    ):
+        check = _make_check(default_instance)
+        mock_query.return_value = query_log_rows
+
+        check._collect_query_logs()
+
+        assert (GAUGE_QUERY_LOG_ROWS, 3) in check._gauges
+
 
 class TestCollectTextLogs:
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_sends_logs_and_updates_cursor(self, mock_query, default_instance, text_log_rows):
+    def test_sends_logs_and_updates_cursor(
+        self, mock_query, default_instance, text_log_rows
+    ):
         check = _make_check(default_instance)
         mock_query.return_value = text_log_rows
 
@@ -262,12 +497,28 @@ class TestCollectTextLogs:
 
         check._collect_text_logs()
 
-        assert ("clickhouse_cloud.text_log.can_connect", MockAgentCheck.CRITICAL) in check._service_checks
+        assert (SC_TEXT_LOG_CONNECT, MockAgentCheck.CRITICAL) in check._service_checks
+
+    @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
+    def test_gauge_reports_row_count(self, mock_query, default_instance, text_log_rows):
+        check = _make_check(default_instance)
+        mock_query.return_value = text_log_rows
+
+        check._collect_text_logs()
+
+        assert (GAUGE_TEXT_LOG_ROWS, 3) in check._gauges
+
+
+# ---------------------------------------------------------------------------
+# Entry point tests
+# ---------------------------------------------------------------------------
 
 
 class TestCheckEntryPoint:
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_check_calls_both_collectors(self, mock_query, default_instance, query_log_rows, text_log_rows):
+    def test_check_calls_both_collectors(
+        self, mock_query, default_instance, query_log_rows, text_log_rows
+    ):
         check = _make_check(default_instance)
         # First call returns query logs, second returns text logs
         mock_query.side_effect = [query_log_rows, text_log_rows]
@@ -288,7 +539,9 @@ class TestCheckEntryPoint:
         mock_query.assert_not_called()
 
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_cursor_persists_across_runs(self, mock_query, default_instance, query_log_rows):
+    def test_cursor_persists_across_runs(
+        self, mock_query, default_instance, query_log_rows
+    ):
         check = _make_check(default_instance)
         default_instance["collect_text_logs"] = False
         check.collect_text_logs = False
@@ -305,3 +558,21 @@ class TestCheckEntryPoint:
 
         # Cursor should not change on empty run
         assert first_cursor == second_cursor == 1743246010000000
+
+
+# ---------------------------------------------------------------------------
+# Retry adapter tests
+# ---------------------------------------------------------------------------
+
+
+class TestRetryConfiguration:
+    def test_session_has_retry_adapter(self, default_instance):
+        check = _make_check(default_instance)
+        adapter = check._session.get_adapter("https://example.com")
+        assert isinstance(adapter, requests.adapters.HTTPAdapter)
+        assert adapter.max_retries.total == 2
+        assert adapter.max_retries.status_forcelist == [502, 503, 504]
+
+    def test_session_auth_configured(self, default_instance):
+        check = _make_check(default_instance)
+        assert check._session.auth == ("test-key-id", "test-key-secret")

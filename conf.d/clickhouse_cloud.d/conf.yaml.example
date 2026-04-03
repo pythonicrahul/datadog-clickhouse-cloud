@@ -10,9 +10,10 @@ instances:
     collect_text_logs: true                     # default: true
 
     # Tuning
-    log_batch_size: 1000                        # rows per check run
-    slow_query_threshold_ms: 5000              # marks query logs as warning
-    initial_backfill_minutes: 60               # lookback window on first run
+    log_batch_size: 1000                        # rows per check run (1–10000)
+    slow_query_threshold_ms: 5000              # marks query logs as warning (0–3600000)
+    initial_backfill_minutes: 60               # lookback window on first run (1–1440)
+    query_timeout_seconds: 30                  # HTTP timeout per query (5–300)
 
     # Applied to all logs shipped
     tags:
