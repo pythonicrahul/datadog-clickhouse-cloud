@@ -5,6 +5,10 @@ instances:
     key_id: "<your-api-key-id>"                 # required – Cloud API key ID
     key_secret: "<your-api-key-secret>"         # required – Cloud API key secret
 
+    # Cluster / service identity
+    cluster_name: "<your-cluster-name>"         # used as the "service" field in Datadog Logs
+                                                # (default: "clickhouse")
+
     # Log collection toggles
     collect_query_logs: true                    # default: true
     collect_text_logs: true                     # default: true
@@ -19,3 +23,8 @@ instances:
     tags:
       - "env:prod"
       - "clickhouse_cluster:<your-cluster-name>"
+
+logs:
+  - type: integration
+    source: clickhouse
+    

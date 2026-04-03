@@ -9,10 +9,9 @@ exist.
 import json
 import os
 import sys
-
-import pytest
 from unittest.mock import MagicMock as _MagicMock
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # Mock AgentCheck base class

@@ -6,16 +6,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
-
-from checks.clickhouse_cloud import (
-    ClickHouseCloudCheck,
-    SC_QUERY_LOG_CONNECT,
-    SC_TEXT_LOG_CONNECT,
-    GAUGE_QUERY_LOG_ROWS,
-    GAUGE_TEXT_LOG_ROWS,
-)
 from conftest import MockAgentCheck
 
+from checks.clickhouse_cloud import (
+    GAUGE_QUERY_LOG_ROWS,
+    GAUGE_TEXT_LOG_ROWS,
+    SC_QUERY_LOG_CONNECT,
+    SC_TEXT_LOG_CONNECT,
+    ClickHouseCloudCheck,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,9 +68,7 @@ class TestConfigValidation:
 
     def test_invalid_backfill_minutes_raises(self, default_instance):
         default_instance["initial_backfill_minutes"] = 0
-        with pytest.raises(
-            ValueError, match="initial_backfill_minutes must be between"
-        ):
+        with pytest.raises(ValueError, match="initial_backfill_minutes must be between"):
             _make_check(default_instance)
 
     def test_query_timeout_configurable(self, default_instance):
@@ -102,7 +99,7 @@ class TestBuildQueryLogPayload:
 
         assert payload["status"] == "info"
         assert payload["clickhouse.query_type"] == "finish"
-        assert payload["ddsource"] == "clickhouse_cloud"
+        assert payload["ddsource"] == "clickhouse"
         assert payload["service"] == "clickhouse"
         assert payload["clickhouse.query_id"] == "abc-123-def-456"
         assert payload["clickhouse.user"] == "default"
@@ -143,6 +140,22 @@ class TestBuildQueryLogPayload:
 
         assert payload["ddtags"] == ""
 
+    def test_custom_cluster_name_sets_service(self, default_instance, query_log_rows):
+        default_instance["cluster_name"] = "analytics-prod"
+        check = _make_check(default_instance)
+        row = query_log_rows[0]
+        payload = check._build_query_log_payload(row)
+
+        assert payload["service"] == "analytics-prod"
+
+    def test_default_cluster_name_is_clickhouse(self, default_instance, query_log_rows):
+        # No cluster_name in config → defaults to "clickhouse"
+        check = _make_check(default_instance)
+        row = query_log_rows[0]
+        payload = check._build_query_log_payload(row)
+
+        assert payload["service"] == "clickhouse"
+
     def test_missing_fields_use_defaults(self, default_instance):
         """Rows with missing optional fields should not crash."""
         check = _make_check(default_instance)
@@ -168,7 +181,7 @@ class TestBuildTextLogPayload:
         payload = check._build_text_log_payload(row)
 
         assert payload["status"] == "error"
-        assert payload["ddsource"] == "clickhouse_cloud"
+        assert payload["ddsource"] == "clickhouse"
         assert payload["clickhouse.logger"] == "MergeTreeBackgroundExecutor"
         assert "Memory limit exceeded" in payload["message"]
 
@@ -323,24 +336,28 @@ class TestQueryClickhouse:
     def test_http_error_raises(self, default_instance):
         check = _make_check(default_instance)
 
-        with patch.object(
-            check._session,
-            "post",
-            side_effect=requests.exceptions.HTTPError("500 Server Error"),
+        with (
+            patch.object(
+                check._session,
+                "post",
+                side_effect=requests.exceptions.HTTPError("500 Server Error"),
+            ),
+            pytest.raises(requests.exceptions.HTTPError),
         ):
-            with pytest.raises(requests.exceptions.HTTPError):
-                check._query_clickhouse("SELECT 1")
+            check._query_clickhouse("SELECT 1")
 
     def test_connection_error_raises(self, default_instance):
         check = _make_check(default_instance)
 
-        with patch.object(
-            check._session,
-            "post",
-            side_effect=requests.exceptions.ConnectionError("DNS failed"),
+        with (
+            patch.object(
+                check._session,
+                "post",
+                side_effect=requests.exceptions.ConnectionError("DNS failed"),
+            ),
+            pytest.raises(requests.exceptions.ConnectionError),
         ):
-            with pytest.raises(requests.exceptions.ConnectionError):
-                check._query_clickhouse("SELECT 1")
+            check._query_clickhouse("SELECT 1")
 
     def test_multiline_json_each_row_parsed(self, default_instance):
         check = _make_check(default_instance)
@@ -372,9 +389,7 @@ class TestQueryClickhouse:
 
 class TestCollectQueryLogs:
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_sends_logs_and_updates_cursor(
-        self, mock_query, default_instance, query_log_rows
-    ):
+    def test_sends_logs_and_updates_cursor(self, mock_query, default_instance, query_log_rows):
         check = _make_check(default_instance)
         mock_query.return_value = query_log_rows
 
@@ -411,9 +426,7 @@ class TestCollectQueryLogs:
         assert len(check._sent_logs) == 0
 
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_no_send_log_method_does_not_crash(
-        self, mock_query, default_instance, query_log_rows
-    ):
+    def test_no_send_log_method_does_not_crash(self, mock_query, default_instance, query_log_rows):
         check = _make_check(default_instance)
         mock_query.return_value = query_log_rows[:1]
 
@@ -464,9 +477,7 @@ class TestCollectQueryLogs:
         assert check.log.warning.called
 
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_gauge_reports_row_count(
-        self, mock_query, default_instance, query_log_rows
-    ):
+    def test_gauge_reports_row_count(self, mock_query, default_instance, query_log_rows):
         check = _make_check(default_instance)
         mock_query.return_value = query_log_rows
 
@@ -477,9 +488,7 @@ class TestCollectQueryLogs:
 
 class TestCollectTextLogs:
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_sends_logs_and_updates_cursor(
-        self, mock_query, default_instance, text_log_rows
-    ):
+    def test_sends_logs_and_updates_cursor(self, mock_query, default_instance, text_log_rows):
         check = _make_check(default_instance)
         mock_query.return_value = text_log_rows
 
@@ -539,9 +548,7 @@ class TestCheckEntryPoint:
         mock_query.assert_not_called()
 
     @patch("checks.clickhouse_cloud.ClickHouseCloudCheck._query_clickhouse")
-    def test_cursor_persists_across_runs(
-        self, mock_query, default_instance, query_log_rows
-    ):
+    def test_cursor_persists_across_runs(self, mock_query, default_instance, query_log_rows):
         check = _make_check(default_instance)
         default_instance["collect_text_logs"] = False
         check.collect_text_logs = False
