@@ -20,8 +20,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install ruff
-        run: pip install ruff
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
 
       - name: Ruff check
         run: ruff check .
