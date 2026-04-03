@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import requests
+from datadog_checks.base import AgentCheck
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-from datadog_checks.base import AgentCheck
-
 
 # ---------------------------------------------------------------------------
 # SQL templates
@@ -161,10 +160,12 @@ class ClickHouseCloudCheck(AgentCheck):
 
         self.custom_tags: list[str] = inst.get("tags", [])
 
+        # Cluster name → used as the Datadog "service" field on every log.
+        # Defaults to "clickhouse" so logs are attributed even without config.
+        self.cluster_name: str = inst.get("cluster_name", "clickhouse")
+
         # HTTP session with automatic retries on transient failures
-        self.base_url: str = "https://queries.clickhouse.cloud/service/{}/run".format(
-            self.service_id
-        )
+        self.base_url: str = f"https://queries.clickhouse.cloud/service/{self.service_id}/run"
 
         retry_strategy = Retry(
             total=2,
@@ -198,11 +199,9 @@ class ClickHouseCloudCheck(AgentCheck):
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            raise ValueError("{} must be an integer, got {!r}".format(key, raw))
+            raise ValueError(f"{key} must be an integer, got {raw!r}") from None
         if value < lo or value > hi:
-            raise ValueError(
-                "{} must be between {} and {}, got {}".format(key, lo, hi, value)
-            )
+            raise ValueError(f"{key} must be between {lo} and {hi}, got {value}")
         return value
 
     # ------------------------------------------------------------------
@@ -388,18 +387,15 @@ class ClickHouseCloudCheck(AgentCheck):
             type_label = "exception"
         else:
             duration_ms = int(row.get("query_duration_ms", 0))
-            if duration_ms >= self.slow_query_threshold_ms:
-                level = "warning"
-            else:
-                level = "info"
+            level = "warning" if duration_ms >= self.slow_query_threshold_ms else "info"
             type_label = "finish"
 
         return {
             "timestamp": self._timestamp_seconds(row),
             "message": row.get("query", ""),
-            "ddsource": "clickhouse_cloud",
+            "ddsource": "clickhouse",
             "ddtags": ",".join(self.custom_tags) if self.custom_tags else "",
-            "service": "clickhouse",
+            "service": self.cluster_name,
             "status": level,
             "clickhouse.query_id": row.get("query_id", ""),
             "clickhouse.user": row.get("user", ""),
@@ -437,9 +433,9 @@ class ClickHouseCloudCheck(AgentCheck):
         return {
             "timestamp": self._timestamp_seconds(row),
             "message": row.get("message", ""),
-            "ddsource": "clickhouse_cloud",
+            "ddsource": "clickhouse",
             "ddtags": ",".join(self.custom_tags) if self.custom_tags else "",
-            "service": "clickhouse",
+            "service": self.cluster_name,
             "status": level,
             "clickhouse.logger": row.get("logger_name", ""),
             "clickhouse.thread_id": str(row.get("thread_id", "")),
